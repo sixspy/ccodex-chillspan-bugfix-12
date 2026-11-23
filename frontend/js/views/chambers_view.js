@@ -41,11 +41,14 @@ export const chambersViewTemplate = `
     <h3>仓间详情 · {{ chamberDetail.chamber.name }}</h3>
     <p>在批 {{ chamberDetail.active_batch_count }} · 剩余配额 {{ chamberDetail.quota_left }}</p>
     <table class="data-table compact">
-      <thead><tr><th>探头</th><th>在线</th><th>校准到期</th></tr></thead>
+      <thead><tr><th>探头</th><th>在线</th><th>正式在批</th><th>单轨</th><th>争用痕</th><th>校准到期</th></tr></thead>
       <tbody>
         <tr v-for="p in chamberDetail.probes" :key="p.id">
           <td>{{ p.probe_code }}</td>
           <td>{{ p.online_status }}</td>
+          <td>{{ p.active_batches }}</td>
+          <td><span class="badge" :class="p.single_track_violations ? 'fail' : 'pass'">{{ p.single_track_violations ? '违例' : '单轨' }}</span></td>
+          <td>{{ p.contention_count || 0 }}</td>
           <td>{{ p.calibration_due }}</td>
         </tr>
       </tbody>

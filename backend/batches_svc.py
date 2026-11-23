@@ -7,7 +7,14 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from locks import (
+    ACTIVE_BATCH_PARAMS,
+    ACTIVE_BATCH_WHERE,
+    probe_lock_key,
+    record_contention,
+    release,
+    try_acquire,
+)
 from models import BatchIn
 from validators import summarize_points, validate_probe_online, validate_temp_point
 
@@ -86,29 +93,55 @@ def get_batch(batch_id: int, authorization: AuthHeader = None):
 @router.post("/api/batches")
 def create_batch(body: BatchIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
-    # BUGFIX-12 埋雷：本应占 probe 锁串行，改成空操作锁键
-    lock_key = f"noop-probe:{body.probe_id}:{user}"
+    # 甲路径定稿：同探头建批单轨互斥，锁键只认探头、不掺持有人
+    lock_key = probe_lock_key(body.probe_id)
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        if not try_acquire(conn, lock_key, user):
+            # 抢锁即争用：争用痕已在锁服务落表，先提交再拒，零业务写入
+            conn.commit()
+            raise HTTPException(409, "争用：该探头正被其他建批占用")
         try:
             ch = conn.execute(
                 "SELECT * FROM cold_chambers WHERE id=?", (body.chamber_id,)
             ).fetchone()
             if not ch:
                 raise HTTPException(404, "仓间不存在")
-            active = conn.execute(
-                """SELECT COUNT(*) c FROM temp_batches
-                   WHERE chamber_id=? AND status NOT IN ('已封批','作废')""",
-                (body.chamber_id,),
-            ).fetchone()["c"]
-            if active >= int(ch["quota_batches"]):
-                raise HTTPException(409, "仓间在批配额已满")
             probe = conn.execute(
                 "SELECT * FROM probes WHERE id=?", (body.probe_id,)
             ).fetchone()
             if not probe or probe["chamber_id"] != body.chamber_id:
                 raise HTTPException(422, "探头与仓间不匹配")
             validate_probe_online(probe)
+            # 锁内硬检查：同探头已有正式在批，第二笔零增拒建并写争用痕
+            active_on_probe = conn.execute(
+                f"""SELECT batch_code FROM temp_batches
+                    WHERE probe_id=? AND {ACTIVE_BATCH_WHERE}
+                    ORDER BY id DESC LIMIT 1""",
+                (body.probe_id, *ACTIVE_BATCH_PARAMS),
+            ).fetchone()
+            if active_on_probe is not None:
+                record_contention(
+                    conn,
+                    lock_key,
+                    user,
+                    f"在批拒建：在批占用={active_on_probe['batch_code']}",
+                )
+                write_audit(
+                    conn,
+                    user,
+                    "batch_contention_reject",
+                    active_on_probe["batch_code"],
+                    {"probe_id": body.probe_id},
+                )
+                conn.commit()
+                raise HTTPException(409, "争用：该探头已有正式在批，禁止双批并存")
+            active = conn.execute(
+                f"""SELECT COUNT(*) c FROM temp_batches
+                   WHERE chamber_id=? AND {ACTIVE_BATCH_WHERE}""",
+                (body.chamber_id, *ACTIVE_BATCH_PARAMS),
+            ).fetchone()["c"]
+            if active >= int(ch["quota_batches"]):
+                raise HTTPException(409, "仓间在批配额已满")
             points = body.temp_points or []
             for pt in points:
                 validate_temp_point(
@@ -157,3 +190,4 @@ def create_batch(body: BatchIn, authorization: AuthHeader = None):
             }
         finally:
             release(conn, lock_key, user)
+            conn.commit()

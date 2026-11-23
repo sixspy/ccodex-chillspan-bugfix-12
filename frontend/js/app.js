@@ -48,6 +48,7 @@ createApp({
     const routes = ref([]);
     const carrierJobs = ref([]);
     const thawJobs = ref([]);
+    const contentionRows = ref([]);
     const dash = ref({});
 
     const chamberDetail = ref(null);
@@ -57,6 +58,8 @@ createApp({
     const reconOne = ref(null);
     const proofOne = ref(null);
     const reconAllItems = ref([]);
+    const probeTracks = ref([]);
+    const probeTrackSummary = ref({});
     const reconCode = ref("CK-HD-01");
     const proofCode = ref("TB-CK-HD-01-002");
 
@@ -153,6 +156,14 @@ createApp({
       return String(t).slice(0, 48) + (String(t).length > 48 ? "…" : "");
     }
 
+    function probeOptionLabel(p) {
+      const n = (p.active_batches || []).length;
+      return n ? `${p.probe_code}（在批 ${n}）` : p.probe_code;
+    }
+    function selectedBatchProbe() {
+      return probes.value.find((p) => p.id === batchForm.value.probe_id) || null;
+    }
+
     async function login() {
       err.value = "";
       const r = await fetch("/api/login", {
@@ -192,7 +203,7 @@ createApp({
       if (!token.value) return;
       clearFlash();
       try {
-        const [ch, pr, bt, ex, sl, sp, lg, cal, rt, d, cj, tj] = await Promise.all([
+        const [ch, pr, bt, ex, sl, sp, lg, cal, rt, d, cj, tj, ct] = await Promise.all([
           api.chambers(),
           api.probes(),
           api.batches(),
@@ -205,6 +216,7 @@ createApp({
           api.dashboard(),
           api.carrierJobs(),
           api.thawJobs(),
+          api.contention(),
         ]);
         chambers.value = ch.items || [];
         probes.value = pr.items || [];
@@ -218,6 +230,7 @@ createApp({
         dash.value = d || {};
         carrierJobs.value = cj.items || [];
         thawJobs.value = tj.items || [];
+        contentionRows.value = ct.items || [];
 
         if (chambers.value.length && !probeForm.value.chamber_id) {
           probeForm.value.chamber_id = chambers.value[0].id;
@@ -395,6 +408,8 @@ createApp({
       try {
         const r = await api.reconcile();
         reconAllItems.value = r.items || [];
+        probeTracks.value = r.probe_tracks || [];
+        probeTrackSummary.value = (r.summary && r.summary.probe_single_track) || {};
         flashOk("全仓对账已刷新");
       } catch (e) {
         flashErr(e);
@@ -469,6 +484,7 @@ createApp({
       routes,
       carrierJobs,
       thawJobs,
+      contentionRows,
       dash,
       chamberDetail,
       probeDetail,
@@ -477,6 +493,8 @@ createApp({
       reconOne,
       proofOne,
       reconAllItems,
+      probeTracks,
+      probeTrackSummary,
       reconCode,
       proofCode,
       chamberForm,
@@ -494,6 +512,8 @@ createApp({
       openableBatches,
       sealableBatches,
       sealedBatches,
+      probeOptionLabel,
+      selectedBatchProbe,
       login,
       logout,
       refresh,

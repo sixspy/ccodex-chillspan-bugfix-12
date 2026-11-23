@@ -5,6 +5,11 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from locks import (
+    ACTIVE_BATCH_PARAMS,
+    ACTIVE_BATCH_WHERE,
+    probe_lock_key,
+)
 from models import ChamberIn
 
 router = APIRouter(tags=["chambers"])
@@ -35,19 +40,35 @@ def get_chamber(chamber_id: int, authorization: AuthHeader = None):
         ).fetchone()
         if not ch:
             raise HTTPException(404, "仓间不存在")
-        probes = conn.execute(
+        probes_raw = conn.execute(
             "SELECT * FROM probes WHERE chamber_id=? ORDER BY id",
             (chamber_id,),
         ).fetchall()
+        probes = []
+        for p in probes_raw:
+            d = dict(p)
+            n = conn.execute(
+                f"""SELECT COUNT(*) c FROM temp_batches
+                    WHERE probe_id=? AND {ACTIVE_BATCH_WHERE}""",
+                (d["id"], *ACTIVE_BATCH_PARAMS),
+            ).fetchone()["c"]
+            traces = conn.execute(
+                "SELECT COUNT(*) c FROM contention_log WHERE lock_key=?",
+                (probe_lock_key(d["id"]),),
+            ).fetchone()["c"]
+            d["active_batches"] = n
+            d["single_track_violations"] = max(0, n - 1)
+            d["contention_count"] = traces
+            probes.append(d)
         batches = conn.execute(
             """SELECT id,batch_code,status,generation FROM temp_batches
                WHERE chamber_id=? ORDER BY id DESC LIMIT 20""",
             (chamber_id,),
         ).fetchall()
         active = conn.execute(
-            """SELECT COUNT(*) c FROM temp_batches
-               WHERE chamber_id=? AND status NOT IN ('已封批','作废')""",
-            (chamber_id,),
+            f"""SELECT COUNT(*) c FROM temp_batches
+               WHERE chamber_id=? AND {ACTIVE_BATCH_WHERE}""",
+            (chamber_id, *ACTIVE_BATCH_PARAMS),
         ).fetchone()["c"]
         return {
             "chamber": dict(ch),

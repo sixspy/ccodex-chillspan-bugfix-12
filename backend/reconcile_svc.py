@@ -5,17 +5,60 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
 from db import connect
+from locks import ACTIVE_BATCH_PARAMS, ACTIVE_BATCH_WHERE, probe_lock_key
 
 router = APIRouter(tags=["reconcile"])
+
+
+def _probe_track_summary(conn) -> dict:
+    """全探头单轨/争用汇总，供对账视图与探头/争用痕视图同源核对。"""
+    probes = conn.execute("SELECT id, probe_code, chamber_id FROM probes ORDER BY id").fetchall()
+    items = []
+    violation_probes = 0
+    contention_hits = 0
+    for p in probes:
+        n = conn.execute(
+            f"""SELECT COUNT(*) c FROM temp_batches
+                WHERE probe_id=? AND {ACTIVE_BATCH_WHERE}""",
+            (p["id"], *ACTIVE_BATCH_PARAMS),
+        ).fetchone()["c"]
+        traces = conn.execute(
+            "SELECT COUNT(*) c FROM contention_log WHERE lock_key=?",
+            (probe_lock_key(p["id"]),),
+        ).fetchone()["c"]
+        violation = max(0, n - 1)
+        if violation:
+            violation_probes += 1
+        contention_hits += traces
+        items.append(
+            {
+                "probe_id": p["id"],
+                "probe_code": p["probe_code"],
+                "chamber_id": p["chamber_id"],
+                "active_batches": n,
+                "single_track_violations": violation,
+                "contention_count": traces,
+                "single_track_ok": n <= 1,
+            }
+        )
+    return {
+        "items": items,
+        "summary": {
+            "probes": len(items),
+            "violation_probes": violation_probes,
+            "contention_total": contention_hits,
+            "all_single_track": violation_probes == 0,
+        },
+    }
 
 
 def _chamber_recon(conn, chamber) -> dict:
     cid = chamber["id"]
     quota = int(chamber["quota_batches"])
     active = conn.execute(
-        """SELECT COUNT(*) c FROM temp_batches
-           WHERE chamber_id=? AND status NOT IN ('已封批','作废')""",
-        (cid,),
+        f"""SELECT COUNT(*) c FROM temp_batches
+           WHERE chamber_id=? AND {ACTIVE_BATCH_WHERE}""",
+        (cid, *ACTIVE_BATCH_PARAMS),
     ).fetchone()["c"]
     sealed = conn.execute(
         """SELECT COUNT(*) c FROM temp_batches
@@ -48,13 +91,16 @@ def reconcile_all(authorization: AuthHeader = None):
         chambers = conn.execute("SELECT * FROM cold_chambers ORDER BY id").fetchall()
         items = [_chamber_recon(conn, c) for c in chambers]
         bad = [i for i in items if not i["balanced"]]
+        probe_track = _probe_track_summary(conn)
         return {
             "items": items,
             "summary": {
                 "total": len(items),
                 "balanced": len(items) - len(bad),
                 "unbalanced": len(bad),
+                "probe_single_track": probe_track["summary"],
             },
+            "probe_tracks": probe_track["items"],
         }
 
 

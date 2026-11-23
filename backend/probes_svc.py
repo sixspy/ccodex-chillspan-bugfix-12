@@ -5,9 +5,37 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from locks import ACTIVE_BATCH_PARAMS, ACTIVE_BATCH_WHERE, probe_lock_key
 from models import ProbeIn
 
 router = APIRouter(tags=["probes"])
+
+
+def _probe_contention_summary(conn, probe_id: int) -> dict:
+    """同探头建批争用痕（与 contention_log 同源，不另造口径）。"""
+    key = probe_lock_key(probe_id)
+    total = conn.execute(
+        "SELECT COUNT(*) c FROM contention_log WHERE lock_key=?", (key,)
+    ).fetchone()["c"]
+    last = conn.execute(
+        """SELECT actor,action,detail,created_at FROM contention_log
+           WHERE lock_key=? ORDER BY id DESC LIMIT 1""",
+        (key,),
+    ).fetchone()
+    return {
+        "lock_key": key,
+        "contention_count": total,
+        "last_contention": dict(last) if last else None,
+    }
+
+
+def _probe_active_batches(conn, probe_id: int) -> list:
+    rows = conn.execute(
+        f"""SELECT id,batch_code,status,generation FROM temp_batches
+            WHERE probe_id=? AND {ACTIVE_BATCH_WHERE} ORDER BY id DESC""",
+        (probe_id, *ACTIVE_BATCH_PARAMS),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 @router.get("/api/probes")
@@ -26,7 +54,16 @@ def list_probes(authorization: AuthHeader = None, chamber_id: int | None = None)
                 """SELECT p.*, c.chamber_code, c.region FROM probes p
                    JOIN cold_chambers c ON c.id=p.chamber_id ORDER BY p.id"""
             ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        items = []
+        for r in rows:
+            d = dict(r)
+            active = _probe_active_batches(conn, d["id"])
+            d["active_batches"] = active
+            # 单轨不变量：同一探头正式在批至多一笔
+            d["single_track_violations"] = max(0, len(active) - 1)
+            d.update(_probe_contention_summary(conn, d["id"]))
+            items.append(d)
+        return {"items": items}
 
 
 @router.get("/api/probes/{probe_id}")
@@ -45,7 +82,14 @@ def get_probe(probe_id: int, authorization: AuthHeader = None):
             "SELECT * FROM calibration_records WHERE probe_id=? ORDER BY id DESC",
             (probe_id,),
         ).fetchall()
-        return {"probe": dict(row), "calibrations": [dict(x) for x in cals]}
+        active = _probe_active_batches(conn, probe_id)
+        return {
+            "probe": dict(row),
+            "calibrations": [dict(x) for x in cals],
+            "active_batches": active,
+            "single_track_violations": max(0, len(active) - 1),
+            "contention": _probe_contention_summary(conn, probe_id),
+        }
 
 
 @router.post("/api/probes")
